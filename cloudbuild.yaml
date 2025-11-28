@@ -13,7 +13,8 @@ steps:
       - "push"
       - "us-central1-docker.pkg.dev/$PROJECT_ID/scraper/scraper-image:latest"
 
-  # Deploy to Cloud Run with increased memory for Playwright/Chromium
+  # Deploy to Cloud Run with memory/CPU for Playwright/Chromium
+  # Chromium needs ~500MB minimum, we use 1Gi for headroom
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
     entrypoint: "gcloud"
     args:
@@ -27,12 +28,11 @@ steps:
       - "--platform"
       - "managed"
       - "--allow-unauthenticated"
-      - "--memory"
-      - "2Gi"
-      - "--cpu"
-      - "2"
-      - "--timeout"
-      - "300"
+      - "--memory=1Gi"
+      - "--cpu=1"
+      - "--timeout=300"
+      - "--concurrency=1"
+      - "--max-instances=3"
 
 images:
   - "us-central1-docker.pkg.dev/$PROJECT_ID/scraper/scraper-image:latest"

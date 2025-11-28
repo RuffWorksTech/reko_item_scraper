@@ -180,43 +180,90 @@ def is_js_rendered_site(html_content, url=""):
     return False
 
 
+def get_playwright_browser():
+    """Get or create a persistent Playwright browser instance.
+    
+    Reuses the same browser across all requests to save memory and startup time.
+    Each Chromium launch uses ~200MB, so reusing is critical for efficiency.
+    """
+    global PLAYWRIGHT_BROWSER, _PLAYWRIGHT_CONTEXT
+    
+    if not USE_PLAYWRIGHT:
+        return None, None
+    
+    # Create browser only once and reuse it
+    if PLAYWRIGHT_BROWSER is None:
+        print("🚀 Starting Playwright browser (one-time)...", file=sys.stderr)
+        global _PLAYWRIGHT_MANAGER
+        _PLAYWRIGHT_MANAGER = sync_playwright().start()
+        
+        # Launch with minimal memory footprint
+        PLAYWRIGHT_BROWSER = _PLAYWRIGHT_MANAGER.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-dev-shm-usage',  # Reduces memory usage in Docker
+                '--disable-gpu',  # Not needed for scraping
+                '--no-sandbox',  # Required for some Docker environments
+                '--disable-setuid-sandbox',
+                '--disable-extensions',  # Don't load extensions
+                '--disable-background-networking',
+                '--disable-sync',
+                '--disable-translate',
+                '--metrics-recording-only',
+                '--mute-audio',
+                '--no-first-run',
+                '--safebrowsing-disable-auto-update',
+            ]
+        )
+        
+        # Create a single context with smaller viewport to save memory
+        _PLAYWRIGHT_CONTEXT = PLAYWRIGHT_BROWSER.new_context(
+            user_agent=random.choice(USER_AGENTS),
+            viewport={"width": 1280, "height": 720}  # Smaller viewport = less memory
+        )
+    
+    return PLAYWRIGHT_BROWSER, _PLAYWRIGHT_CONTEXT
+
+# Global context for reuse
+_PLAYWRIGHT_CONTEXT = None
+_PLAYWRIGHT_MANAGER = None
+
+
 def fetch_with_playwright(url, timeout=30):
     """Use Playwright to fetch JavaScript-rendered pages.
     
-    This is used as a fallback for sites that require browser rendering
-    (e.g., Wix, React SPAs, Angular apps).
+    OPTIMIZED: Reuses a single browser instance across all requests
+    instead of launching a new browser for each page (~200MB savings per page).
     """
-    global PLAYWRIGHT_BROWSER
-    
     if not USE_PLAYWRIGHT:
         print("Playwright not installed - cannot render JS pages", file=sys.stderr)
         return None
     
     try:
-        print(f"Using Playwright to render JS page: {url}", file=sys.stderr)
+        print(f"📄 Rendering: {url}", file=sys.stderr)
         
-        # Use sync_playwright context manager for thread safety
-        with sync_playwright() as p:
-            # Launch headless browser (Chromium) for rendering JavaScript
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=random.choice(USER_AGENTS),
-                viewport={"width": 1920, "height": 1080}
-            )
-            page = context.new_page()
+        # Get or create the persistent browser
+        browser, context = get_playwright_browser()
+        if not browser or not context:
+            return None
+        
+        # Create a new page (lightweight, ~5MB vs ~200MB for new browser)
+        page = context.new_page()
+        
+        try:
+            # Navigate and wait for DOM to be ready (faster than networkidle)
+            page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
             
-            # Navigate and wait for network to be idle (ensures JS has loaded)
-            page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
-            
-            # Give extra time for dynamic content to render
-            page.wait_for_timeout(2000)
+            # Short wait for JS to render dynamic content
+            page.wait_for_timeout(1000)
             
             # Get the fully rendered HTML content
             html_content = page.content()
             
-            browser.close()
-            
             return html_content
+        finally:
+            # Always close the page to free memory, but keep browser running
+            page.close()
             
     except Exception as e:
         print(f"Playwright error for {url}: {e}", file=sys.stderr)
@@ -224,14 +271,31 @@ def fetch_with_playwright(url, timeout=30):
 
 
 def close_playwright():
-    """Clean up Playwright browser instance."""
-    global PLAYWRIGHT_BROWSER
+    """Clean up Playwright browser instance - call when scraping is complete."""
+    global PLAYWRIGHT_BROWSER, _PLAYWRIGHT_CONTEXT, _PLAYWRIGHT_MANAGER
+    
+    if _PLAYWRIGHT_CONTEXT:
+        try:
+            _PLAYWRIGHT_CONTEXT.close()
+        except:
+            pass
+        _PLAYWRIGHT_CONTEXT = None
+    
     if PLAYWRIGHT_BROWSER:
         try:
             PLAYWRIGHT_BROWSER.close()
         except:
             pass
         PLAYWRIGHT_BROWSER = None
+    
+    if _PLAYWRIGHT_MANAGER:
+        try:
+            _PLAYWRIGHT_MANAGER.stop()
+        except:
+            pass
+        _PLAYWRIGHT_MANAGER = None
+    
+    print("🧹 Playwright browser closed", file=sys.stderr)
 
 
 def fetch_url(session, url, method="GET", timeout=15, allow_cloudscraper=True, referer=None):
