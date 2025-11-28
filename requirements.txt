@@ -1,0 +1,10 @@
+flask
+flask-cors
+requests
+beautifulsoup4
+cloudscraper
+selenium
+webdriver-manager
+python-dotenv
+lxml
+google-cloud-storage
