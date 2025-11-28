@@ -17,13 +17,23 @@ try:
 except ImportError:
     USE_CLOUDSCRAPER = False
 
+# Playwright is used for JavaScript-heavy sites that require browser rendering
+# (e.g., Wix, React, Vue, Angular SPAs)
+try:
+    from playwright.sync_api import sync_playwright
+    USE_PLAYWRIGHT = True
+except ImportError:
+    USE_PLAYWRIGHT = False
+
 # Base headers mimic a modern browser; per-request rotation is layered on top
 # inside `build_rotating_headers` to avoid static fingerprints.
+# Note: We use 'gzip, deflate' instead of 'gzip, deflate, br' because
+# Brotli (br) requires the brotli package to decompress properly.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
@@ -61,6 +71,17 @@ def _load_proxy_pool():
 
 PROXY_POOL = _load_proxy_pool()
 CLOUDSCRAPER_SESSION = None
+PLAYWRIGHT_BROWSER = None
+
+# JavaScript framework indicators - if these are found in the page, it's likely JS-rendered
+JS_FRAMEWORK_INDICATORS = [
+    'wix.com', 'wixstatic.com', 'parastorage.com',  # Wix
+    '__NEXT_DATA__', '_next/',  # Next.js
+    'ng-app', 'ng-controller',  # Angular
+    '__NUXT__',  # Nuxt.js
+    'data-reactroot', '__REACT_DEVTOOLS',  # React
+    'data-v-', 'data-vue',  # Vue
+]
 
 
 def human_delay(min_wait=0.8, max_wait=1.8):
@@ -129,6 +150,88 @@ def get_cloudscraper_session():
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
     return CLOUDSCRAPER_SESSION
+
+
+def is_js_rendered_site(html_content, url=""):
+    """Detect if a site is primarily JavaScript-rendered (like Wix, React SPAs).
+    
+    Returns True if the page appears to be JS-rendered and needs a browser to scrape.
+    """
+    html_lower = html_content.lower()
+    url_lower = url.lower()
+    
+    # Check URL patterns first for known JS platforms
+    if any(indicator in url_lower for indicator in ['wix.com', 'squarespace.com', 'webflow.io']):
+        return True
+    
+    # Check for framework indicators in the HTML content
+    for indicator in JS_FRAMEWORK_INDICATORS:
+        if indicator.lower() in html_lower:
+            return True
+    
+    # If the page has very little visible text content but lots of scripts, it's likely JS-rendered
+    # Count script tags vs actual content length (rough heuristic)
+    script_count = html_lower.count('<script')
+    visible_content = len(html_content) - html_lower.count('<script') * 500  # rough estimate
+    
+    if script_count > 20 and visible_content < 5000:
+        return True
+    
+    return False
+
+
+def fetch_with_playwright(url, timeout=30):
+    """Use Playwright to fetch JavaScript-rendered pages.
+    
+    This is used as a fallback for sites that require browser rendering
+    (e.g., Wix, React SPAs, Angular apps).
+    """
+    global PLAYWRIGHT_BROWSER
+    
+    if not USE_PLAYWRIGHT:
+        print("Playwright not installed - cannot render JS pages", file=sys.stderr)
+        return None
+    
+    try:
+        print(f"Using Playwright to render JS page: {url}", file=sys.stderr)
+        
+        # Use sync_playwright context manager for thread safety
+        with sync_playwright() as p:
+            # Launch headless browser (Chromium) for rendering JavaScript
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                viewport={"width": 1920, "height": 1080}
+            )
+            page = context.new_page()
+            
+            # Navigate and wait for network to be idle (ensures JS has loaded)
+            page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
+            
+            # Give extra time for dynamic content to render
+            page.wait_for_timeout(2000)
+            
+            # Get the fully rendered HTML content
+            html_content = page.content()
+            
+            browser.close()
+            
+            return html_content
+            
+    except Exception as e:
+        print(f"Playwright error for {url}: {e}", file=sys.stderr)
+        return None
+
+
+def close_playwright():
+    """Clean up Playwright browser instance."""
+    global PLAYWRIGHT_BROWSER
+    if PLAYWRIGHT_BROWSER:
+        try:
+            PLAYWRIGHT_BROWSER.close()
+        except:
+            pass
+        PLAYWRIGHT_BROWSER = None
 
 
 def fetch_url(session, url, method="GET", timeout=15, allow_cloudscraper=True, referer=None):
@@ -234,9 +337,10 @@ def get_product_links_from_sitemap(base_url, session, visited=None):
                 for url in urls:
                     url_text = url.text
                     # Match various e-commerce URL patterns
+                    # Match various e-commerce URL patterns - includes Wix product-page for Wix sites
                     if any(pattern in url_text.lower() for pattern in [
                         '/product/', '/products/', '/p/', '/item/', '/items/',
-                        '/shop/', '/store/', '.html', '/buy/', '/pd/'
+                        '/shop/', '/store/', '.html', '/buy/', '/pd/', '/product-page/'
                     ]):
                         product_links.add(url_text)
                 
@@ -249,22 +353,51 @@ def get_product_links_from_sitemap(base_url, session, visited=None):
     return product_links
 
 
-def get_product_links(category_url, session):
-    """Collect product URLs from page (supports ALL e-commerce platforms)."""
+def get_product_links(category_url, session, use_playwright=False):
+    """Collect product URLs from page (supports ALL e-commerce platforms).
+    
+    If use_playwright is True or if JS-rendering is detected, uses Playwright
+    to render the page before extracting product links.
+    """
     product_links = set()
     try:
-        resp = fetch_url(session, category_url, timeout=15)
-        if not resp:
-            return product_links
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html_content = None
+        
+        # If Playwright mode is explicitly enabled, skip HTTP and go straight to browser
+        if use_playwright and USE_PLAYWRIGHT:
+            print("🎭 Rendering page with Playwright browser...", file=sys.stderr)
+            html_content = fetch_with_playwright(category_url)
+            if not html_content:
+                print("⚠️ Playwright rendering failed", file=sys.stderr)
+                return product_links
+        else:
+            # Try with standard HTTP request first
+            resp = fetch_url(session, category_url, timeout=15)
+            if not resp:
+                return product_links
+            
+            html_content = resp.text
+            
+            # Check if this is a JavaScript-rendered site (like Wix)
+            # If so, fall back to Playwright for proper rendering
+            if is_js_rendered_site(html_content, category_url):
+                print("Detected JavaScript-rendered site, using Playwright...", file=sys.stderr)
+                playwright_html = fetch_with_playwright(category_url)
+                if playwright_html:
+                    html_content = playwright_html
+                else:
+                    print("Playwright failed, using static HTML (may be incomplete)", file=sys.stderr)
+        
+        soup = BeautifulSoup(html_content, "html.parser")
 
-        # Universal selectors for all e-commerce platforms
+        # Universal selectors for all e-commerce platforms (including Wix)
         selectors = [
             "a.woocommerce-LoopProduct-link",  # WooCommerce
             "a.product-item-link",  # Magento
             "a.product-link",  # Generic
             "a[href*='/product/']",  # Generic product URLs
             "a[href*='/products/']",  # Shopify
+            "a[href*='/product-page/']",  # Wix product pages
             "a[href*='/p/']",  # Short product URLs
             "a[href*='/item/']",  # Item URLs
             "a[href*='/pd/']",  # Product detail URLs
@@ -276,8 +409,8 @@ def get_product_links(category_url, session):
             ".product-card a",  # Card layouts
         ]
         
-        # URL patterns to match
-        url_patterns = ['/product/', '/products/', '/p/', '/item/', '/items/', '/pd/', '/shop/', '.html']
+        # URL patterns to match - includes Wix product-page pattern for Wix sites
+        url_patterns = ['/product/', '/products/', '/p/', '/item/', '/items/', '/pd/', '/shop/', '.html', '/product-page/']
         
         # Get the base domain to filter out external links
         from urllib.parse import urlparse
@@ -302,8 +435,8 @@ def get_product_links(category_url, session):
                     full_url = urljoin(category_url, href)
                     # Only add if it's from the same domain
                     if urlparse(full_url).netloc == base_domain:
-                        # Avoid navigation/category links
-                        if not any(skip in href.lower() for skip in ['category', 'collection', 'tag', 'page', 'cart', 'checkout', 'account']):
+                        # Avoid navigation/category links (but allow 'product-page' for Wix)
+                        if 'product-page' in href.lower() or not any(skip in href.lower() for skip in ['category', 'collection', 'tag', 'page', 'cart', 'checkout', 'account']):
                             product_links.add(full_url)
         
         next_selectors = ["a.next", ".pagination a[rel='next']", "a[aria-label='Next']"]
@@ -322,6 +455,15 @@ def get_product_links(category_url, session):
 
 def is_simple_product(soup):
     """Check if the product is simple (not grouped, bundle, or configurable) - Universal for all platforms."""
+    
+    # Wix product options/variants - check for option dropdowns or selectors
+    wix_options = soup.select("[data-hook='product-options'] select, [data-hook='product-options'] [role='listbox']")
+    if wix_options:
+        for opt in wix_options:
+            # If the option has multiple choices, it's a variable product
+            options = opt.find_all('option') or opt.find_all('[role="option"]')
+            if len(options) > 1:
+                return False
     
     # WooCommerce variations
     if soup.select("form.variations_form, .variations, table.variations, .single_variation_wrap"):
@@ -374,27 +516,41 @@ def is_simple_product(soup):
     return True
 
 
-def extract_product_data(url, session=None):
-    """Extract product details (universal e-commerce support)."""
+def extract_product_data(url, session=None, use_playwright=False):
+    """Extract product details (universal e-commerce support).
+    
+    If use_playwright is True, uses Playwright to render the page before
+    extracting product data (needed for JS-rendered sites like Wix).
+    """
     try:
         if session is None:
             session = build_retry_session()
         
-        resp = fetch_url(session, url, timeout=20)
-        if not resp:
-            print(f"Skipping {url} after repeated blocks.", file=sys.stderr)
-            return None
+        html_content = None
         
-        soup = BeautifulSoup(resp.text, "html.parser")
+        # If Playwright mode is enabled, use it to render the page
+        if use_playwright and USE_PLAYWRIGHT:
+            html_content = fetch_with_playwright(url)
+        
+        # Fallback to standard HTTP request
+        if not html_content:
+            resp = fetch_url(session, url, timeout=20)
+            if not resp:
+                print(f"Skipping {url} after repeated blocks.", file=sys.stderr)
+                return None
+            html_content = resp.text
+        
+        soup = BeautifulSoup(html_content, "html.parser")
 
         if not is_simple_product(soup):
             print(f"Skipping (not simple): {url}", file=sys.stderr)
             return None
 
-        # Name - Universal selectors for all platforms
+        # Name - Universal selectors for all platforms (including Wix)
         name = (soup.select_one("h1.product_title") or  # WooCommerce
                 soup.select_one("h1.product-title") or  # Generic
                 soup.select_one("h1[itemprop='name']") or  # Schema.org
+                soup.select_one("[data-hook='product-title']") or  # Wix stores
                 soup.select_one(".product-title") or  # Generic
                 soup.select_one("h1.entry-title") or  # WordPress
                 soup.select_one(".page-title") or  # Magento
@@ -418,7 +574,10 @@ def extract_product_data(url, session=None):
             price_text = current_price.get_text(strip=True)
         else:
             # Method 2: Standard e-commerce selectors (if no sale price)
-            price_elem = (soup.select_one("p.price .woocommerce-Price-amount") or  # WooCommerce
+            # Includes Wix-specific data-hook attributes
+            price_elem = (soup.select_one("[data-hook='formatted-primary-price']") or  # Wix stores
+                          soup.select_one("[data-hook='product-price']") or  # Wix stores
+                          soup.select_one("p.price .woocommerce-Price-amount") or  # WooCommerce
                           soup.select_one("span.woocommerce-Price-amount") or  # WooCommerce
                           soup.select_one("p.price") or  # WooCommerce
                           soup.select_one(".product-price") or  # Generic
@@ -564,52 +723,105 @@ def extract_product_data(url, session=None):
 
 
 def scrape_site(base_url):
-    """Main scraping function."""
+    """Main scraping function.
+    
+    Automatically detects JavaScript-rendered sites (like Wix, React SPAs) and
+    uses Playwright browser rendering when needed.
+    """
     session = build_retry_session()
     category_url = base_url
-    print("Method 1: Trying sitemap...", file=sys.stderr)
-    product_links = get_product_links_from_sitemap(base_url, session)
+    use_playwright = False  # Will be set to True if JS-rendering is detected
     
-    if not product_links:
-        print("Method 2: Searching for product pages...", file=sys.stderr)
-        category_url = detect_category_page(base_url, session)
-        product_links = get_product_links(category_url, session)
+    # STEP 0: Quick check if site is JS-rendered or bot-protected
+    # This saves time by avoiding multiple failed requests before trying Playwright
+    if USE_PLAYWRIGHT:
+        print("🔍 Quick check: Testing if site is JavaScript-rendered...", file=sys.stderr)
+        # Do a quick single request (not the full retry loop)
+        try:
+            quick_resp = session.get(base_url, headers=build_rotating_headers(), timeout=10)
+            if quick_resp and quick_resp.status_code == 200:
+                if is_js_rendered_site(quick_resp.text, base_url):
+                    print("🌐 Detected JavaScript-rendered site (Wix/React/Vue)! Using Playwright...", file=sys.stderr)
+                    use_playwright = True
+                elif looks_like_bot_block(quick_resp):
+                    print("🔒 Bot protection detected! Using Playwright browser...", file=sys.stderr)
+                    use_playwright = True
+            else:
+                # Non-200 response or no response - likely bot protection
+                print("🔒 Site may be blocking requests! Using Playwright browser...", file=sys.stderr)
+                use_playwright = True
+        except Exception as e:
+            print(f"⚠️ Quick check failed ({e}), will try Playwright...", file=sys.stderr)
+            use_playwright = True
+    
+    # If Playwright is needed, skip the slow HTTP methods and go straight to browser rendering
+    if use_playwright:
+        print("🎭 Using Playwright browser to render JavaScript...", file=sys.stderr)
+        product_links = get_product_links(base_url, session, use_playwright=True)
+    else:
+        # Standard scraping flow for non-JS sites
+        print("Method 1: Trying sitemap...", file=sys.stderr)
+        product_links = get_product_links_from_sitemap(base_url, session)
+        
+        if not product_links:
+            print("Method 2: Searching for product pages...", file=sys.stderr)
+            category_url = detect_category_page(base_url, session)
+            product_links = get_product_links(category_url, session, use_playwright=False)
+        
+        # If still no products, try Playwright as last resort
+        if not product_links and USE_PLAYWRIGHT:
+            print("Method 3: Trying Playwright browser as fallback...", file=sys.stderr)
+            use_playwright = True
+            product_links = get_product_links(base_url, session, use_playwright=True)
     
     # If still no products, try scraping the homepage directly
     if not product_links and base_url != category_url:
-        print("Method 3: Trying homepage...", file=sys.stderr)
-        product_links = get_product_links(base_url, session)
+        print("Method 4: Trying homepage...", file=sys.stderr)
+        product_links = get_product_links(base_url, session, use_playwright=use_playwright)
     
     print(f"\n🔗 Found {len(product_links)} product links", file=sys.stderr)
     
     if len(product_links) == 0:
-        print("\n No products found!", file=sys.stderr)
+        print("\n❌ No products found!", file=sys.stderr)
         print("Possible reasons:", file=sys.stderr)
-        print("  1. The site uses JavaScript to load products (React/Vue/Angular)", file=sys.stderr)
+        if not USE_PLAYWRIGHT:
+            print("  1. The site uses JavaScript - install playwright: pip install playwright && playwright install chromium", file=sys.stderr)
+        else:
+            print("  1. The site may use a custom JavaScript framework not yet supported", file=sys.stderr)
         print("  2. The site may be blocking automated access", file=sys.stderr)
         print("  3. Try providing a direct category/product listing page URL", file=sys.stderr)
-        print("\n Tip: Navigate to a product category page in your browser,", file=sys.stderr)
+        print("\n💡 Tip: Navigate to a product category page in your browser,", file=sys.stderr)
         print("   copy that URL, and use it with the scraper.\n", file=sys.stderr)
 
-    # Surface whether the stealth fallback is available so operators know expectations.
-    if USE_CLOUDSCRAPER:
-        print(" Cloudscraper fallback enabled for tough endpoints...", file=sys.stderr)
+    # Surface what rendering modes are available
+    if USE_PLAYWRIGHT:
+        print("✅ Playwright browser rendering enabled for JavaScript sites...", file=sys.stderr)
     else:
-        print(" Using hardened requests session (install cloudscraper for tougher sites)...", file=sys.stderr)
+        print("⚠️ Playwright not installed - JS sites may not work (pip install playwright && playwright install chromium)...", file=sys.stderr)
+    
+    if USE_CLOUDSCRAPER:
+        print("✅ Cloudscraper fallback enabled for tough endpoints...", file=sys.stderr)
+    else:
+        print("⚠️ Using hardened requests session (install cloudscraper for tougher sites)...", file=sys.stderr)
     
     data = []
     skipped = 0
     for i, url in enumerate(product_links, 1):
         print(f"Processing {i}/{len(product_links)}: {url}", file=sys.stderr)
-        item = extract_product_data(url, session)
+        # Use Playwright for product pages if the site was detected as JS-rendered
+        item = extract_product_data(url, session, use_playwright=use_playwright)
         if item:
             data.append(item)
-            print(f"Added: {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
+            print(f"✓ Added: {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
         else:
             skipped += 1
         human_delay(1.2, 2.7)  # Jittered delay to avoid rate limiting
     
-    print(f"\nSummary: {len(data)} simple products, {skipped} skipped", file=sys.stderr)
+    # Clean up Playwright browser if it was used
+    if use_playwright:
+        close_playwright()
+    
+    print(f"\n📊 Summary: {len(data)} simple products, {skipped} skipped", file=sys.stderr)
 
     # Always output JSON
     output = json.dumps(data, indent=2)

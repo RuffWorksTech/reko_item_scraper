@@ -5,3 +5,4 @@ cloudscraper
 flask
 flask-cors
 python-dotenv
+playwright

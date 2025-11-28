@@ -13,7 +13,7 @@ steps:
       - "push"
       - "us-central1-docker.pkg.dev/$PROJECT_ID/scraper/scraper-image:latest"
 
-  # Deploy to Cloud Run
+  # Deploy to Cloud Run with increased memory for Playwright/Chromium
   - name: "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
     entrypoint: "gcloud"
     args:
@@ -27,6 +27,12 @@ steps:
       - "--platform"
       - "managed"
       - "--allow-unauthenticated"
+      - "--memory"
+      - "2Gi"
+      - "--cpu"
+      - "2"
+      - "--timeout"
+      - "300"
 
 images:
   - "us-central1-docker.pkg.dev/$PROJECT_ID/scraper/scraper-image:latest"
