@@ -1,10 +1,15 @@
-import requests
-from bs4 import BeautifulSoup
 import json
-import time
+import os
+import random
 import sys
+import time
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 try:
     import cloudscraper
@@ -12,6 +17,8 @@ try:
 except ImportError:
     USE_CLOUDSCRAPER = False
 
+# Base headers mimic a modern browser; per-request rotation is layered on top
+# inside `build_rotating_headers` to avoid static fingerprints.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -21,7 +28,152 @@ HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-def detect_category_page(base_url):
+# Curated desktop UA list keeps us aligned with current browser releases and
+# allows lightweight rotation without pulling in another dependency.
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0",
+]
+
+# Detection hints help us pivot to cloudscraper/proxy retries only when needed.
+DETECTION_KEYWORDS = [
+    "bot detection", "access denied", "just a moment", "captcha",
+    "are you human", "verify your identity", "request blocked",
+]
+
+# Parse optional proxy list once so we can rotate without reparsing env vars.
+def _load_proxy_pool():
+    proxies = os.environ.get("SCRAPER_PROXIES", "")
+    pool = []
+    for raw_proxy in proxies.split(","):
+        proxy = raw_proxy.strip()
+        if not proxy:
+            continue
+        if "://" not in proxy:
+            proxy = f"http://{proxy}"
+        pool.append(proxy)
+    return pool
+
+
+PROXY_POOL = _load_proxy_pool()
+CLOUDSCRAPER_SESSION = None
+
+
+def human_delay(min_wait=0.8, max_wait=1.8):
+    """Sleep for a human-looking interval so we do not hammer the target."""
+    time.sleep(random.uniform(min_wait, max_wait))
+
+
+def build_rotating_headers(referer=None):
+    """Assemble headers that rotate UA + language to reduce fingerprint reuse."""
+    headers = HEADERS.copy()
+    headers["User-Agent"] = random.choice(USER_AGENTS)
+    headers["Accept-Language"] = random.choice(
+        ["en-US,en;q=0.9", "en-US,en;q=0.8,fr;q=0.6", "en-GB,en;q=0.9"]
+    )
+    headers["DNT"] = "1"
+    headers["Sec-Fetch-Dest"] = "document"
+    headers["Sec-Fetch-Mode"] = "navigate"
+    headers["Sec-Fetch-Site"] = "none"
+    headers["Sec-Ch-Ua-Mobile"] = "?0"
+    headers["Sec-Ch-Ua-Platform"] = random.choice(['"Windows"', '"macOS"', '"Linux"'])
+    headers["Referer"] = referer or headers.get("Referer") or "https://www.google.com/"
+    return headers
+
+
+def choose_proxy():
+    """Pick a proxy (if provided) to spread requests across multiple exits."""
+    if not PROXY_POOL:
+        return None
+    proxy = random.choice(PROXY_POOL)
+    return {"http": proxy, "https": proxy}
+
+
+def looks_like_bot_block(response):
+    """Detect common block patterns so we can escalate to stealthier clients."""
+    if response is None:
+        return True
+    if response.status_code in (403, 429, 503):
+        return True
+    text = response.text.lower()
+    return any(keyword in text for keyword in DETECTION_KEYWORDS)
+
+
+def build_retry_session():
+    """Create a Session with sane retries so transient throttling is absorbed."""
+    session = requests.Session()
+    retry_cfg = Retry(
+        total=int(os.environ.get("SCRAPER_HTTP_RETRIES", "3")),
+        backoff_factor=float(os.environ.get("SCRAPER_BACKOFF", "0.7")),
+        status_forcelist=[403, 408, 409, 425, 429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_cfg)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def get_cloudscraper_session():
+    """Lazy init of cloudscraper so we only pay the cost when sites demand it."""
+    global CLOUDSCRAPER_SESSION
+    if not USE_CLOUDSCRAPER:
+        return None
+    if CLOUDSCRAPER_SESSION is None:
+        CLOUDSCRAPER_SESSION = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+    return CLOUDSCRAPER_SESSION
+
+
+def fetch_url(session, url, method="GET", timeout=15, allow_cloudscraper=True, referer=None):
+    """Perform an HTTP request with rotation + proxy + Cloudflare fallback."""
+    max_attempts = max(1, int(os.environ.get("SCRAPER_TOTAL_ATTEMPTS", "3")))
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        headers = build_rotating_headers(referer=referer)
+        proxies = choose_proxy()
+        try:
+            response = session.request(
+                method,
+                url,
+                headers=headers,
+                timeout=timeout,
+                proxies=proxies,
+            )
+            if response is not None and not looks_like_bot_block(response):
+                return response
+            print(f"Bot protection triggered on attempt {attempt} for {url}", file=sys.stderr)
+            if allow_cloudscraper:
+                cloud_session = get_cloudscraper_session()
+                if cloud_session:
+                    try:
+                        cloud_response = cloud_session.request(
+                            method,
+                            url,
+                            headers=headers,
+                            timeout=timeout,
+                            proxies=proxies,
+                        )
+                        if cloud_response is not None and not looks_like_bot_block(cloud_response):
+                            return cloud_response
+                    except Exception as cloud_err:
+                        last_error = cloud_err
+                        print(f"Cloudscraper error for {url}: {cloud_err}", file=sys.stderr)
+        except requests.RequestException as exc:
+            last_error = exc
+            print(f"Request error for {url}: {exc}", file=sys.stderr)
+        human_delay(0.9, 2.2)
+    if last_error:
+        print(f"Giving up on {url}: {last_error}", file=sys.stderr)
+    return None
+
+def detect_category_page(base_url, session):
     """Try to find product listing pages automatically."""
     # Common e-commerce paths
     possible_paths = [
@@ -35,20 +187,17 @@ def detect_category_page(base_url):
     
     for path in possible_paths:
         test_url = urljoin(base_url, path)
-        try:
-            r = requests.get(test_url, headers=HEADERS, timeout=10)
-            if r.status_code == 200 and "product" in r.text.lower():
+        resp = fetch_url(session, test_url, timeout=12, allow_cloudscraper=False, referer=base_url)
+        if resp and resp.status_code == 200 and "product" in resp.text.lower():
                 print(f"Found product page: {test_url}", file=sys.stderr)
                 return test_url
-        except requests.RequestException:
-            continue
     
     # If no specific path works, try the homepage
     print("No specific product page found, trying homepage...", file=sys.stderr)
     return base_url
 
 
-def get_product_links_from_sitemap(base_url, visited=None):
+def get_product_links_from_sitemap(base_url, session, visited=None):
     """Try to get product links from sitemap.xml."""
     if visited is None:
         visited = set()
@@ -67,8 +216,8 @@ def get_product_links_from_sitemap(base_url, visited=None):
         
         try:
             print(f"Checking sitemap: {sitemap_url}", file=sys.stderr)
-            resp = requests.get(sitemap_url, headers=HEADERS, timeout=10)
-            if resp.status_code == 200:
+            resp = fetch_url(session, sitemap_url, timeout=15)
+            if resp and resp.status_code == 200:
                 root = ET.fromstring(resp.content)
                 ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
                 
@@ -78,7 +227,7 @@ def get_product_links_from_sitemap(base_url, visited=None):
                     for sitemap in sitemaps:
                         sitemap_text = sitemap.text
                         if sitemap_text not in visited and 'product' in sitemap_text.lower():
-                            product_links.update(get_product_links_from_sitemap(sitemap_text, visited))
+                            product_links.update(get_product_links_from_sitemap(sitemap_text, session, visited))
                 
                 # Get URLs from sitemap
                 urls = root.findall('.//ns:url/ns:loc', ns)
@@ -100,11 +249,13 @@ def get_product_links_from_sitemap(base_url, visited=None):
     return product_links
 
 
-def get_product_links(category_url):
+def get_product_links(category_url, session):
     """Collect product URLs from page (supports ALL e-commerce platforms)."""
     product_links = set()
     try:
-        resp = requests.get(category_url, headers=HEADERS, timeout=10)
+        resp = fetch_url(session, category_url, timeout=15)
+        if not resp:
+            return product_links
         soup = BeautifulSoup(resp.text, "html.parser")
 
         # Universal selectors for all e-commerce platforms
@@ -160,7 +311,7 @@ def get_product_links(category_url):
             next_link = soup.select_one(selector)
             if next_link:
                 next_url = urljoin(category_url, next_link.get("href"))
-                product_links.update(get_product_links(next_url))
+                product_links.update(get_product_links(next_url, session))
                 break
                 
     except Exception as e:
@@ -227,15 +378,12 @@ def extract_product_data(url, session=None):
     """Extract product details (universal e-commerce support)."""
     try:
         if session is None:
-            session = requests.Session()
+            session = build_retry_session()
         
-        resp = session.get(url, headers=HEADERS, timeout=15)
-        
-        # Check if blocked by Cloudflare
-        if resp.status_code == 403 or "Just a moment" in resp.text:
-            print(f"Cloudflare protection detected, retrying...", file=sys.stderr)
-            time.sleep(3)
-            resp = session.get(url, headers=HEADERS, timeout=15)
+        resp = fetch_url(session, url, timeout=20)
+        if not resp:
+            print(f"Skipping {url} after repeated blocks.", file=sys.stderr)
+            return None
         
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -417,18 +565,20 @@ def extract_product_data(url, session=None):
 
 def scrape_site(base_url):
     """Main scraping function."""
+    session = build_retry_session()
+    category_url = base_url
     print("Method 1: Trying sitemap...", file=sys.stderr)
-    product_links = get_product_links_from_sitemap(base_url)
+    product_links = get_product_links_from_sitemap(base_url, session)
     
     if not product_links:
         print("Method 2: Searching for product pages...", file=sys.stderr)
-        category_url = detect_category_page(base_url)
-        product_links = get_product_links(category_url)
+        category_url = detect_category_page(base_url, session)
+        product_links = get_product_links(category_url, session)
     
     # If still no products, try scraping the homepage directly
     if not product_links and base_url != category_url:
         print("Method 3: Trying homepage...", file=sys.stderr)
-        product_links = get_product_links(base_url)
+        product_links = get_product_links(base_url, session)
     
     print(f"\n🔗 Found {len(product_links)} product links", file=sys.stderr)
     
@@ -441,13 +591,11 @@ def scrape_site(base_url):
         print("\n Tip: Navigate to a product category page in your browser,", file=sys.stderr)
         print("   copy that URL, and use it with the scraper.\n", file=sys.stderr)
 
-    # Use cloudscraper if available, otherwise regular session
+    # Surface whether the stealth fallback is available so operators know expectations.
     if USE_CLOUDSCRAPER:
-        print(" Using cloudscraper to bypass Cloudflare...", file=sys.stderr)
-        session = cloudscraper.create_scraper()
+        print(" Cloudscraper fallback enabled for tough endpoints...", file=sys.stderr)
     else:
-        print(" Using regular requests (install cloudscraper for better results)...", file=sys.stderr)
-        session = requests.Session() if not USE_CLOUDSCRAPER else None
+        print(" Using hardened requests session (install cloudscraper for tougher sites)...", file=sys.stderr)
     
     data = []
     skipped = 0
@@ -459,12 +607,14 @@ def scrape_site(base_url):
             print(f"Added: {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
         else:
             skipped += 1
-        time.sleep(1)  # Delay to avoid rate limiting
+        human_delay(1.2, 2.7)  # Jittered delay to avoid rate limiting
     
     print(f"\nSummary: {len(data)} simple products, {skipped} skipped", file=sys.stderr)
 
     # Always output JSON
-    print(json.dumps(data, indent=2))
+    output = json.dumps(data, indent=2)
+    print(output)
+    return data
 
 
 if __name__ == "__main__":
@@ -490,7 +640,6 @@ if __name__ == "__main__":
     print(f"\n Starting scrape for: {url}\n", file=sys.stderr)
     scrape_site(url)
     
-import os
 def run():
     url = os.environ.get("SCRAPE_URL")
     if not url:
