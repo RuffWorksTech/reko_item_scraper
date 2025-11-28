@@ -1,0 +1,19 @@
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-t"
+      - "us-central1-docker.pkg.dev/$PROJECT_ID/scraper/scraper-image:latest"
+      - "."
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "us-central1-docker.pkg.dev/$PROJECT_ID/scraper/scraper-image:latest"
+  - name: "us-central1-docker.pkg.dev/$PROJECT_ID/scraper/scraper-image:latest"
+    entrypoint: "python3"
+    args:
+      - "/app/scraper.py"
+      - "https://example.com"
+
+images:
+  - "us-central1-docker.pkg.dev/$PROJECT_ID/scraper/scraper-image:latest"
