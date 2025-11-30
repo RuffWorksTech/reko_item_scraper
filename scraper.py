@@ -786,11 +786,111 @@ def extract_product_data(url, session=None, use_playwright=False):
         return None
 
 
-def scrape_site(base_url):
+def send_progress_update(api_base_url, agent_token, discovered=None, sent=None, created=None, total=None, phase=None, message=None):
+    """Send progress update to the backend API (optional, best-effort).
+    
+    Args:
+        api_base_url: Base URL for the API (e.g., https://staging.rekohub.com/api)
+        agent_token: Bearer token for authentication
+        discovered: Number of items discovered during scraping
+        sent: Number of items POSTed to the API
+        created: Number of items confirmed created by backend
+        total: Best-effort estimate of total items
+        phase: Current phase ("discovery" | "scraping" | "importing" | "complete" | "error")
+        message: Human-readable status message
+    """
+    if not api_base_url or not agent_token:
+        return  # Progress updates are optional
+    
+    try:
+        payload = {}
+        if discovered is not None:
+            payload['discoveredCount'] = discovered
+        if sent is not None:
+            payload['sentCount'] = sent
+        if created is not None:
+            payload['createdCount'] = created
+        if total is not None:
+            payload['totalCount'] = total
+        if phase is not None:
+            payload['phase'] = phase
+        if message is not None:
+            payload['message'] = message
+        
+        # Only send if we have something to report
+        if not payload:
+            return
+        
+        progress_url = f"{api_base_url.rstrip('/')}/v4/auto-onboard/progress"
+        headers = {
+            'Authorization': f'Bearer {agent_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.post(progress_url, json=payload, headers=headers, timeout=10)
+        if response.status_code == 202:
+            print(f"📊 Progress update sent: {message or payload}", file=sys.stderr)
+        else:
+            print(f"⚠️ Progress update failed: {response.status_code}", file=sys.stderr)
+    except Exception as e:
+        # Don't fail the scrape if progress updates fail
+        print(f"⚠️ Progress update error: {e}", file=sys.stderr)
+
+
+def send_item_to_api(api_base_url, agent_token, item):
+    """Send a single item to the backend API immediately after scraping.
+    
+    Args:
+        api_base_url: Base URL for the API (e.g., https://staging.rekohub.com/api)
+        agent_token: Bearer token for authentication
+        item: Item dict with name, price, description, imageUrl, url
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if not api_base_url or not agent_token:
+        return False
+    
+    try:
+        items_url = f"{api_base_url.rstrip('/')}/v4/auto-onboard/items"
+        headers = {
+            'Authorization': f'Bearer {agent_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Map our item format to the API format
+        # The API expects: name, description, price, imageUrl
+        # Our item has: name, price, description, imageUrl, url
+        payload = {
+            'name': item.get('name', ''),
+            'description': item.get('description', ''),
+            'price': item.get('price', ''),
+            'imageUrl': item.get('imageUrl', ''),
+            'sourceItemId': item.get('url', '')  # Use source URL as identifier
+        }
+        
+        response = requests.post(items_url, json=payload, headers=headers, timeout=15)
+        if response.status_code == 202:
+            print(f"✅ Item sent to API: {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
+            return True
+        else:
+            print(f"⚠️ Failed to send item (HTTP {response.status_code}): {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
+            return False
+    except Exception as e:
+        print(f"⚠️ Error sending item to API: {e}", file=sys.stderr)
+        return False
+
+
+def scrape_site(base_url, api_base_url=None, agent_token=None):
     """Main scraping function.
     
     Automatically detects JavaScript-rendered sites (like Wix, React SPAs) and
     uses Playwright browser rendering when needed.
+    
+    Args:
+        base_url: The URL to scrape
+        api_base_url: Optional API base URL for progress updates
+        agent_token: Optional bearer token for progress updates
     """
     session = build_retry_session()
     category_url = base_url
@@ -845,6 +945,16 @@ def scrape_site(base_url):
     
     print(f"\n🔗 Found {len(product_links)} product links", file=sys.stderr)
     
+    # Send initial discovery progress update
+    send_progress_update(
+        api_base_url, 
+        agent_token,
+        discovered=len(product_links),
+        total=len(product_links),
+        phase="discovery",
+        message=f"Discovered {len(product_links)} products"
+    )
+    
     if len(product_links) == 0:
         print("\n❌ No products found!", file=sys.stderr)
         print("Possible reasons:", file=sys.stderr)
@@ -870,22 +980,85 @@ def scrape_site(base_url):
     
     data = []
     skipped = 0
+    sent_count = 0
+    total_links = len(product_links)
+    has_api_integration = bool(api_base_url and agent_token)
+    
+    # Send initial scraping phase update
+    send_progress_update(
+        api_base_url,
+        agent_token,
+        discovered=total_links,
+        sent=0,
+        total=total_links,
+        phase="scraping",
+        message=f"Starting to scrape {total_links} products"
+    )
+    
     for i, url in enumerate(product_links, 1):
-        print(f"Processing {i}/{len(product_links)}: {url}", file=sys.stderr)
+        print(f"Processing {i}/{total_links}: {url}", file=sys.stderr)
         # Use Playwright for product pages if the site was detected as JS-rendered
         item = extract_product_data(url, session, use_playwright=use_playwright)
+        
         if item:
             data.append(item)
-            print(f"✓ Added: {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
+            print(f"✓ Scraped: {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
+            
+            # If API integration is enabled, send item immediately
+            if has_api_integration:
+                success = send_item_to_api(api_base_url, agent_token, item)
+                if success:
+                    sent_count += 1
+            
+            # Send progress update after each successful item (for real-time updates)
+            send_progress_update(
+                api_base_url,
+                agent_token,
+                discovered=total_links,
+                sent=sent_count if has_api_integration else len(data),
+                created=sent_count if has_api_integration else len(data),
+                total=total_links,
+                phase="importing",
+                message=f"Imported {sent_count if has_api_integration else len(data)} of {total_links} products ({skipped} skipped)"
+            )
         else:
             skipped += 1
+            # Send progress update even for skipped items to show activity
+            send_progress_update(
+                api_base_url,
+                agent_token,
+                discovered=total_links,
+                sent=sent_count if has_api_integration else len(data),
+                created=sent_count if has_api_integration else len(data),
+                total=total_links,
+                phase="importing",
+                message=f"Imported {sent_count if has_api_integration else len(data)} of {total_links} products ({skipped} skipped)"
+            )
+        
         human_delay(1.2, 2.7)  # Jittered delay to avoid rate limiting
     
     # Clean up Playwright browser if it was used
     if use_playwright:
         close_playwright()
     
-    print(f"\n📊 Summary: {len(data)} simple products, {skipped} skipped", file=sys.stderr)
+    has_api_integration = bool(api_base_url and agent_token)
+    final_count = sent_count if has_api_integration else len(data)
+    
+    print(f"\n📊 Summary: {len(data)} simple products scraped, {skipped} skipped", file=sys.stderr)
+    if has_api_integration:
+        print(f"📤 Sent {sent_count} items to API", file=sys.stderr)
+    
+    # Send final completion update
+    send_progress_update(
+        api_base_url,
+        agent_token,
+        discovered=total_links,
+        sent=final_count,
+        created=final_count,
+        total=total_links,
+        phase="complete",
+        message=f"Completed: {final_count} products imported, {skipped} skipped"
+    )
 
     # Always output JSON
     output = json.dumps(data, indent=2)

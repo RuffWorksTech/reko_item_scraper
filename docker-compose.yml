@@ -1,0 +1,48 @@
+# Docker Compose file for local development
+# This allows easy local testing of the scraper service
+version: '3.8'
+
+services:
+  scraper:
+    # Build the Docker image from the current directory
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    # Name the container for easy reference
+    container_name: reko_item_scraper
+    
+    # Expose port 8080 to the host machine
+    # Access the service at http://localhost:8080
+    ports:
+      - "8080:8080"
+    
+    # Environment variables for configuration
+    environment:
+      - PORT=8080
+      # Optional: Add proxy pool if you have proxies
+      # - SCRAPER_PROXIES=http://proxy1:port,http://proxy2:port
+      # Optional: Customize retry behavior
+      # - SCRAPER_HTTP_RETRIES=3
+      # - SCRAPER_BACKOFF=0.7
+      # - SCRAPER_TOTAL_ATTEMPTS=3
+    
+    # Restart policy for robustness
+    restart: unless-stopped
+    
+    # Shared memory size (important for Playwright/Chromium in Docker)
+    # Chromium needs more shared memory to avoid crashes
+    shm_size: '2gb'
+    
+    # Health check to ensure the service is running
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/?url=https://example.com"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+
+
+
+
