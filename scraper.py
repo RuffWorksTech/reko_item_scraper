@@ -1014,12 +1014,25 @@ def send_item_to_api(api_base_url, agent_token, item):
             'sourceItemId': item.get('url', '')  # Use source URL as identifier
         }
 
+        log(f"📤 Sending item to API: name='{payload.get('name', '')[:50]}', price='{payload.get('price', '')}', imageUrl={bool(payload.get('imageUrl'))}")
         response = requests.post(items_url, json=payload, headers=headers, timeout=15)
         if response.status_code == 202:
             log(f"✅ Item sent to API: {item.get('name', 'Unknown')[:50]}")
             return True
         else:
             log(f"⚠️ Failed to send item (HTTP {response.status_code}): {item.get('name', 'Unknown')[:50]}")
+            # Log the payload that was sent for debugging
+            log(f"   Payload: name='{payload.get('name')}', price='{payload.get('price')}', description='{payload.get('description', '')[:100]}...'")
+            log(f"   Payload: imageUrl='{payload.get('imageUrl', '')[:80]}', sourceItemId='{payload.get('sourceItemId', '')[:80]}'")
+            # Log the response body for debugging
+            try:
+                response_data = response.json()
+                log(f"   Response: status={response_data.get('status')}, code={response_data.get('code')}, message={response_data.get('message')}")
+                if response_data.get('extra'):
+                    log(f"   Extra: {response_data.get('extra')}")
+            except Exception:
+                # If response is not JSON, log raw text
+                log(f"   Response body: {response.text[:500]}")
             return False
     except Exception as e:
         log(f"⚠️ Error sending item to API: {e}")
