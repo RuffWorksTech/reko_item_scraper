@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import random
@@ -14,6 +15,10 @@ from urllib3.util import Retry
 
 # Thread-local storage for site prefix in logs
 _thread_local = threading.local()
+
+# Memory management: restart Playwright every N pages to prevent memory bloat
+PLAYWRIGHT_RESTART_INTERVAL = int(os.environ.get("PLAYWRIGHT_RESTART_INTERVAL", "25"))
+_playwright_page_count = 0
 
 
 def get_site_tag(url: str) -> str:
@@ -181,6 +186,8 @@ def build_retry_session():
 
     We handle retries ourselves in fetch_url() with better logging and backoff,
     so we reduce urllib3's internal retries to avoid hidden delays.
+
+    Connection pool is kept small to prevent resource exhaustion in long scrapes.
     """
     session = requests.Session()
 
@@ -202,11 +209,15 @@ def build_retry_session():
         read=0,
     )
 
-    # Increase pool size to handle concurrent requests better
+    # Keep pool small to prevent resource exhaustion - we're scraping sequentially
+    # pool_connections=2: connections to different hosts
+    # pool_maxsize=5: max connections per host (we only need 1-2 really)
+    # pool_block=False: don't block waiting for connections, fail fast
     adapter = HTTPAdapter(
         max_retries=retry_cfg,
-        pool_connections=10,
-        pool_maxsize=20,
+        pool_connections=2,
+        pool_maxsize=5,
+        pool_block=False,
     )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
@@ -229,6 +240,31 @@ def get_cloudscraper_session():
         )
         _cloudscraper_sessions.session = session
     return session
+
+
+def cleanup_sessions(session=None):
+    """Clean up HTTP sessions to free resources and connections.
+
+    Call this periodically during long scrapes to prevent connection pool exhaustion.
+    """
+    # Close main session if provided
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    # Close thread-local cloudscraper session
+    cs_session = getattr(_cloudscraper_sessions, 'session', None)
+    if cs_session is not None:
+        try:
+            cs_session.close()
+        except Exception:
+            pass
+        _cloudscraper_sessions.session = None
+
+    # Force garbage collection to clean up socket handles
+    gc.collect()
 
 
 def is_js_rendered_site(html_content, url=""):
@@ -313,37 +349,50 @@ def fetch_with_playwright(url, timeout=30):
 
     OPTIMIZED: Reuses a single browser instance across all requests
     instead of launching a new browser for each page (~200MB savings per page).
+
+    MEMORY MANAGEMENT: Restarts browser every PLAYWRIGHT_RESTART_INTERVAL pages
+    to prevent memory accumulation from long-running scrapes.
     """
+    global _playwright_page_count
+
     if not USE_PLAYWRIGHT:
         log("Playwright not installed - cannot render JS pages")
         return None
 
     try:
+        # Check if we should restart the browser to free memory
+        _playwright_page_count += 1
+        if _playwright_page_count >= PLAYWRIGHT_RESTART_INTERVAL:
+            log(f"� Restarting Playwright browser after {_playwright_page_count} pages (memory cleanup)...")
+            close_playwright()
+            _playwright_page_count = 0
+            gc.collect()  # Force garbage collection after closing browser
+
         log(f"📄 Rendering: {url}")
-        
+
         # Get or create the persistent browser
         browser, context = get_playwright_browser()
         if not browser or not context:
             return None
-        
+
         # Create a new page (lightweight, ~5MB vs ~200MB for new browser)
         page = context.new_page()
-        
+
         try:
             # Navigate and wait for DOM to be ready (faster than networkidle)
             page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
-            
+
             # Short wait for JS to render dynamic content
             page.wait_for_timeout(1000)
-            
+
             # Get the fully rendered HTML content
             html_content = page.content()
-            
+
             return html_content
         finally:
             # Always close the page to free memory, but keep browser running
             page.close()
-            
+
     except Exception as e:
         log(f"Playwright error for {url}: {e}")
         return None
@@ -1014,7 +1063,7 @@ def send_item_to_api(api_base_url, agent_token, item):
             'sourceItemId': item.get('url', '')  # Use source URL as identifier
         }
 
-        log(f"📤 Sending item to API: name='{payload.get('name', '')[:50]}', price='{payload.get('price', '')}', imageUrl={bool(payload.get('imageUrl'))}")
+        log(f"Sending item to API: name='{payload.get('name', '')[:50]}', price='{payload.get('price', '')}', imageUrl={bool(payload.get('imageUrl'))}")
         response = requests.post(items_url, json=payload, headers=headers, timeout=15)
         if response.status_code == 202:
             log(f"✅ Item sent to API: {item.get('name', 'Unknown')[:50]}")
@@ -1156,6 +1205,9 @@ def scrape_site(base_url, api_base_url=None, agent_token=None):
         message=f"Starting to scrape {total_links} products"
     )
 
+    # Memory management: run GC and log memory every N items
+    gc_interval = int(os.environ.get("SCRAPER_GC_INTERVAL", "20"))
+
     for i, url in enumerate(product_links, 1):
         log(f"Processing {i}/{total_links}: {url}")
         # Use Playwright for product pages if the site was detected as JS-rendered
@@ -1164,13 +1216,13 @@ def scrape_site(base_url, api_base_url=None, agent_token=None):
         if item:
             data.append(item)
             log(f"✓ Scraped: {item.get('name', 'Unknown')[:50]}")
-            
+
             # If API integration is enabled, send item immediately
             if has_api_integration:
                 success = send_item_to_api(api_base_url, agent_token, item)
                 if success:
                     sent_count += 1
-            
+
             # Send progress update after each successful item (for real-time updates)
             send_progress_update(
                 api_base_url,
@@ -1195,10 +1247,31 @@ def scrape_site(base_url, api_base_url=None, agent_token=None):
                 phase="importing",
                 message=f"Imported {sent_count if has_api_integration else len(data)} of {total_links} products ({skipped} skipped)"
             )
-        
+
+        # Memory management: periodic garbage collection and memory logging
+        if i % gc_interval == 0:
+            gc.collect()
+            try:
+                import resource
+                mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # Convert KB to MB on Linux
+                # On macOS, ru_maxrss is already in bytes, so divide by 1024*1024
+                if sys.platform == 'darwin':
+                    mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+                log(f"🧠 Memory: ~{mem_mb:.0f}MB after {i} items (GC ran)")
+            except ImportError:
+                log(f"🔄 Garbage collection ran after {i} items")
+
+        # Session cleanup: refresh session every 50 items to prevent connection pool issues
+        session_refresh_interval = int(os.environ.get("SCRAPER_SESSION_REFRESH", "50"))
+        if i % session_refresh_interval == 0:
+            log(f"🔄 Refreshing HTTP session after {i} items...")
+            cleanup_sessions(session)
+            session = build_retry_session()  # Create fresh session
+
         human_delay(1.2, 2.7)  # Jittered delay to avoid rate limiting
-    
-    # Clean up Playwright browser if it was used
+
+    # Clean up all resources
+    cleanup_sessions(session)
     if use_playwright:
         close_playwright()
     
