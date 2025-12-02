@@ -5,11 +5,62 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlparse
+import threading
 
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
+
+# Thread-local storage for site prefix in logs
+_thread_local = threading.local()
+
+
+def get_site_tag(url: str) -> str:
+    """Extract a short identifier from URL for log prefixing.
+
+    Examples:
+        https://www.beeboxgifts.com/product/foo -> [beeboxgifts]
+        https://boiselamb.com/collections/all -> [boiselamb]
+        https://botlfarm.eatfromfarms.com/product/x -> [botlfarm]
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        # Remove www. prefix
+        if host.startswith("www."):
+            host = host[4:]
+        # Get the first part of the domain (subdomain or main domain)
+        parts = host.split(".")
+        if len(parts) >= 2:
+            # If subdomain exists and isn't generic, use it
+            if parts[0] not in ("www", "shop", "store", "www2"):
+                return parts[0]
+            # Otherwise use main domain name
+            return parts[1] if len(parts) > 1 else parts[0]
+        return parts[0]
+    except Exception:
+        return "unknown"
+
+
+def set_current_site(url: str):
+    """Set the current site being scraped for this thread."""
+    _thread_local.site_tag = get_site_tag(url)
+    _thread_local.site_url = url
+
+
+def get_current_site_tag() -> str:
+    """Get the current site tag for this thread."""
+    return getattr(_thread_local, "site_tag", "")
+
+
+def log(message: str, file=sys.stderr):
+    """Log a message with the current site prefix."""
+    tag = get_current_site_tag()
+    if tag:
+        print(f"[{tag}] {message}", file=file)
+    else:
+        print(message, file=file)
 
 try:
     import cloudscraper
@@ -70,7 +121,8 @@ def _load_proxy_pool():
 
 
 PROXY_POOL = _load_proxy_pool()
-CLOUDSCRAPER_SESSION = None
+# Thread-local storage for cloudscraper sessions (avoids concurrent interference)
+_cloudscraper_sessions = threading.local()
 PLAYWRIGHT_BROWSER = None
 
 # JavaScript framework indicators - if these are found in the page, it's likely JS-rendered
@@ -125,31 +177,58 @@ def looks_like_bot_block(response):
 
 
 def build_retry_session():
-    """Create a Session with sane retries so transient throttling is absorbed."""
+    """Create a Session with minimal internal retries.
+
+    We handle retries ourselves in fetch_url() with better logging and backoff,
+    so we reduce urllib3's internal retries to avoid hidden delays.
+    """
     session = requests.Session()
+
+    # Reduce internal retries - we handle retries in fetch_url() with logging
+    # Setting total=1 means urllib3 will try once and fail fast
+    # This prevents hidden 45+ second delays from internal retry loops
+    internal_retries = int(os.environ.get("SCRAPER_HTTP_RETRIES", "1"))
+
     retry_cfg = Retry(
-        total=int(os.environ.get("SCRAPER_HTTP_RETRIES", "3")),
-        backoff_factor=float(os.environ.get("SCRAPER_BACKOFF", "0.7")),
-        status_forcelist=[403, 408, 409, 425, 429, 500, 502, 503, 504],
+        total=internal_retries,
+        backoff_factor=0.5,  # Short backoff since we handle it ourselves
+        status_forcelist=[408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524],
+        # Note: removed 403 from status_forcelist - we handle bot detection ourselves
         allowed_methods=["HEAD", "GET", "OPTIONS"],
         raise_on_status=False,
+        respect_retry_after_header=True,
+        # Don't retry on connection errors - let our outer loop handle it with logging
+        connect=0,
+        read=0,
     )
-    adapter = HTTPAdapter(max_retries=retry_cfg)
+
+    # Increase pool size to handle concurrent requests better
+    adapter = HTTPAdapter(
+        max_retries=retry_cfg,
+        pool_connections=10,
+        pool_maxsize=20,
+    )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
 
 
 def get_cloudscraper_session():
-    """Lazy init of cloudscraper so we only pay the cost when sites demand it."""
-    global CLOUDSCRAPER_SESSION
+    """Get or create a thread-local cloudscraper session.
+
+    Each thread gets its own session to avoid interference during concurrent scraping.
+    This is critical when multiple sites are being scraped simultaneously.
+    """
     if not USE_CLOUDSCRAPER:
         return None
-    if CLOUDSCRAPER_SESSION is None:
-        CLOUDSCRAPER_SESSION = cloudscraper.create_scraper(
+
+    session = getattr(_cloudscraper_sessions, 'session', None)
+    if session is None:
+        session = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
-    return CLOUDSCRAPER_SESSION
+        _cloudscraper_sessions.session = session
+    return session
 
 
 def is_js_rendered_site(html_content, url=""):
@@ -193,7 +272,7 @@ def get_playwright_browser():
     
     # Create browser only once and reuse it
     if PLAYWRIGHT_BROWSER is None:
-        print("🚀 Starting Playwright browser (one-time)...", file=sys.stderr)
+        log("🚀 Starting Playwright browser (one-time)...")
         global _PLAYWRIGHT_MANAGER
         _PLAYWRIGHT_MANAGER = sync_playwright().start()
         
@@ -231,16 +310,16 @@ _PLAYWRIGHT_MANAGER = None
 
 def fetch_with_playwright(url, timeout=30):
     """Use Playwright to fetch JavaScript-rendered pages.
-    
+
     OPTIMIZED: Reuses a single browser instance across all requests
     instead of launching a new browser for each page (~200MB savings per page).
     """
     if not USE_PLAYWRIGHT:
-        print("Playwright not installed - cannot render JS pages", file=sys.stderr)
+        log("Playwright not installed - cannot render JS pages")
         return None
-    
+
     try:
-        print(f"📄 Rendering: {url}", file=sys.stderr)
+        log(f"📄 Rendering: {url}")
         
         # Get or create the persistent browser
         browser, context = get_playwright_browser()
@@ -266,78 +345,144 @@ def fetch_with_playwright(url, timeout=30):
             page.close()
             
     except Exception as e:
-        print(f"Playwright error for {url}: {e}", file=sys.stderr)
+        log(f"Playwright error for {url}: {e}")
         return None
 
 
 def close_playwright():
     """Clean up Playwright browser instance - call when scraping is complete."""
     global PLAYWRIGHT_BROWSER, _PLAYWRIGHT_CONTEXT, _PLAYWRIGHT_MANAGER
-    
+
     if _PLAYWRIGHT_CONTEXT:
         try:
             _PLAYWRIGHT_CONTEXT.close()
         except:
             pass
         _PLAYWRIGHT_CONTEXT = None
-    
+
     if PLAYWRIGHT_BROWSER:
         try:
             PLAYWRIGHT_BROWSER.close()
         except:
             pass
         PLAYWRIGHT_BROWSER = None
-    
+
     if _PLAYWRIGHT_MANAGER:
         try:
             _PLAYWRIGHT_MANAGER.stop()
         except:
             pass
         _PLAYWRIGHT_MANAGER = None
-    
-    print("🧹 Playwright browser closed", file=sys.stderr)
+
+    log("🧹 Playwright browser closed")
+
+
+def _is_retryable_network_error(error):
+    """Check if an error is a retryable network-level issue (SSL, proxy, connection)."""
+    error_str = str(error).lower()
+    retryable_patterns = [
+        'ssl', 'eof', 'connection', 'proxy', 'timeout',
+        'reset', 'refused', 'disconnected', 'broken pipe',
+        'max retries', 'remote end closed'
+    ]
+    return any(pattern in error_str for pattern in retryable_patterns)
 
 
 def fetch_url(session, url, method="GET", timeout=15, allow_cloudscraper=True, referer=None):
-    """Perform an HTTP request with rotation + proxy + Cloudflare fallback."""
-    max_attempts = max(1, int(os.environ.get("SCRAPER_TOTAL_ATTEMPTS", "3")))
+    """Perform an HTTP request with rotation + proxy + Cloudflare fallback.
+
+    Includes exponential backoff for network-level errors (SSL, proxy, connection issues)
+    in addition to HTTP-level bot detection handling.
+    """
+    max_attempts = max(1, int(os.environ.get("SCRAPER_TOTAL_ATTEMPTS", "4")))
+    base_backoff = float(os.environ.get("SCRAPER_BACKOFF", "2.0"))
     last_error = None
+
+    # Shorter URL for logging
+    short_url = url.split('/')[-1][:40] if '/' in url else url[:40]
+
     for attempt in range(1, max_attempts + 1):
         headers = build_rotating_headers(referer=referer)
         proxies = choose_proxy()
+
+        attempt_start = time.time()
+        log(f"⏱️ Attempt {attempt}/{max_attempts} starting for {short_url}")
+
+        # Calculate exponential backoff delay (only after first attempt)
+        if attempt > 1:
+            backoff_delay = base_backoff * (2 ** (attempt - 2)) + random.uniform(0.5, 1.5)
+            log(f"💤 Backing off for {backoff_delay:.1f}s before retry {attempt}/{max_attempts}")
+            time.sleep(backoff_delay)
+
         try:
+            # Try without proxy on later retries if proxy might be the issue
+            use_proxies = proxies
+            if attempt > 2 and proxies:
+                log(f"🔄 Attempt {attempt}: Trying without proxy...")
+                use_proxies = None
+
+            request_start = time.time()
             response = session.request(
                 method,
                 url,
                 headers=headers,
                 timeout=timeout,
-                proxies=proxies,
+                proxies=use_proxies,
             )
+            request_duration = time.time() - request_start
+
             if response is not None and not looks_like_bot_block(response):
+                log(f"✅ Request succeeded in {request_duration:.1f}s for {short_url}")
                 return response
-            print(f"Bot protection triggered on attempt {attempt} for {url}", file=sys.stderr)
+
+            log(f"🛡️ Bot protection triggered on attempt {attempt} for {url} (took {request_duration:.1f}s)")
+
+            # Try cloudscraper as fallback for bot protection
             if allow_cloudscraper:
                 cloud_session = get_cloudscraper_session()
                 if cloud_session:
                     try:
+                        cloud_start = time.time()
+                        log(f"☁️ Trying cloudscraper fallback for {short_url}...")
+                        # Cloudscraper may work better without our proxy
                         cloud_response = cloud_session.request(
                             method,
                             url,
                             headers=headers,
-                            timeout=timeout,
-                            proxies=proxies,
+                            timeout=timeout + 5,  # Give cloudscraper more time
+                            proxies=None,  # Let cloudscraper handle its own connection
                         )
+                        cloud_duration = time.time() - cloud_start
                         if cloud_response is not None and not looks_like_bot_block(cloud_response):
+                            log(f"✅ Cloudscraper succeeded in {cloud_duration:.1f}s for {short_url}")
                             return cloud_response
+                        log(f"🛡️ Cloudscraper also got bot blocked (took {cloud_duration:.1f}s)")
                     except Exception as cloud_err:
+                        cloud_duration = time.time() - cloud_start
                         last_error = cloud_err
-                        print(f"Cloudscraper error for {url}: {cloud_err}", file=sys.stderr)
+                        if _is_retryable_network_error(cloud_err):
+                            log(f"☁️ Cloudscraper network error after {cloud_duration:.1f}s (will retry): {cloud_err}")
+                        else:
+                            log(f"☁️ Cloudscraper error after {cloud_duration:.1f}s: {cloud_err}")
+
         except requests.RequestException as exc:
+            request_duration = time.time() - request_start
             last_error = exc
-            print(f"Request error for {url}: {exc}", file=sys.stderr)
-        human_delay(0.9, 2.2)
+            if _is_retryable_network_error(exc):
+                log(f"🌐 Network error on attempt {attempt} after {request_duration:.1f}s (will retry): {exc}")
+            else:
+                log(f"❌ Request error after {request_duration:.1f}s for {url}: {exc}")
+
+        attempt_duration = time.time() - attempt_start
+        log(f"⏱️ Attempt {attempt} total duration: {attempt_duration:.1f}s")
+
+        # Small jittered delay between attempts (on top of backoff)
+        jitter = random.uniform(0.5, 1.0)
+        log(f"💤 Jitter delay: {jitter:.1f}s")
+        time.sleep(jitter)
+
     if last_error:
-        print(f"Giving up on {url}: {last_error}", file=sys.stderr)
+        log(f"🚫 Giving up on {url} after {max_attempts} attempts: {last_error}")
     return None
 
 def detect_category_page(base_url, session):
@@ -349,18 +494,18 @@ def detect_category_page(base_url, session):
         "/all-products/", "/shop-all/", "/items/", "/Shop By Categories/",
         "/browse/", "/search/", "/all/", "/all-products/", "/all-categories/", "/Shop by Category/", "/Collections/"
     ]
-    
-    print("Searching for product pages...", file=sys.stderr)
-    
+
+    log("Searching for product pages...")
+
     for path in possible_paths:
         test_url = urljoin(base_url, path)
         resp = fetch_url(session, test_url, timeout=12, allow_cloudscraper=False, referer=base_url)
         if resp and resp.status_code == 200 and "product" in resp.text.lower():
-                print(f"Found product page: {test_url}", file=sys.stderr)
+                log(f"Found product page: {test_url}")
                 return test_url
-    
+
     # If no specific path works, try the homepage
-    print("No specific product page found, trying homepage...", file=sys.stderr)
+    log("No specific product page found, trying homepage...")
     return base_url
 
 
@@ -382,12 +527,12 @@ def get_product_links_from_sitemap(base_url, session, visited=None):
         visited.add(sitemap_url)
         
         try:
-            print(f"Checking sitemap: {sitemap_url}", file=sys.stderr)
+            log(f"Checking sitemap: {sitemap_url}")
             resp = fetch_url(session, sitemap_url, timeout=15)
             if resp and resp.status_code == 200:
                 root = ET.fromstring(resp.content)
                 ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-                
+
                 # Check if it's a sitemap index
                 sitemaps = root.findall('.//ns:sitemap/ns:loc', ns)
                 if sitemaps:
@@ -395,7 +540,7 @@ def get_product_links_from_sitemap(base_url, session, visited=None):
                         sitemap_text = sitemap.text
                         if sitemap_text not in visited and 'product' in sitemap_text.lower():
                             product_links.update(get_product_links_from_sitemap(sitemap_text, session, visited))
-                
+
                 # Get URLs from sitemap
                 urls = root.findall('.//ns:url/ns:loc', ns)
                 for url in urls:
@@ -407,50 +552,50 @@ def get_product_links_from_sitemap(base_url, session, visited=None):
                         '/shop/', '/store/', '.html', '/buy/', '/pd/', '/product-page/'
                     ]):
                         product_links.add(url_text)
-                
+
                 if product_links:
-                    print(f"Found {len(product_links)} products in sitemap", file=sys.stderr)
+                    log(f"Found {len(product_links)} products in sitemap")
                     return product_links
         except Exception:
             continue
-    
+
     return product_links
 
 
 def get_product_links(category_url, session, use_playwright=False):
     """Collect product URLs from page (supports ALL e-commerce platforms).
-    
+
     If use_playwright is True or if JS-rendering is detected, uses Playwright
     to render the page before extracting product links.
     """
     product_links = set()
     try:
         html_content = None
-        
+
         # If Playwright mode is explicitly enabled, skip HTTP and go straight to browser
         if use_playwright and USE_PLAYWRIGHT:
-            print("🎭 Rendering page with Playwright browser...", file=sys.stderr)
+            log("🎭 Rendering page with Playwright browser...")
             html_content = fetch_with_playwright(category_url)
             if not html_content:
-                print("⚠️ Playwright rendering failed", file=sys.stderr)
+                log("⚠️ Playwright rendering failed")
                 return product_links
         else:
             # Try with standard HTTP request first
             resp = fetch_url(session, category_url, timeout=15)
             if not resp:
                 return product_links
-            
+
             html_content = resp.text
-            
+
             # Check if this is a JavaScript-rendered site (like Wix)
             # If so, fall back to Playwright for proper rendering
             if is_js_rendered_site(html_content, category_url):
-                print("Detected JavaScript-rendered site, using Playwright...", file=sys.stderr)
+                log("Detected JavaScript-rendered site, using Playwright...")
                 playwright_html = fetch_with_playwright(category_url)
                 if playwright_html:
                     html_content = playwright_html
                 else:
-                    print("Playwright failed, using static HTML (may be incomplete)", file=sys.stderr)
+                    log("Playwright failed, using static HTML (may be incomplete)")
         
         soup = BeautifulSoup(html_content, "html.parser")
 
@@ -492,7 +637,7 @@ def get_product_links(category_url, session, use_playwright=False):
         
         # If no products found with selectors, try finding ANY links with product patterns
         if not product_links:
-            print("🔍 Trying broader search for product links...", file=sys.stderr)
+            log("🔍 Trying broader search for product links...")
             for a in soup.find_all('a', href=True):
                 href = a.get('href')
                 if href and any(pattern in href.lower() for pattern in url_patterns):
@@ -502,7 +647,7 @@ def get_product_links(category_url, session, use_playwright=False):
                         # Avoid navigation/category links (but allow 'product-page' for Wix)
                         if 'product-page' in href.lower() or not any(skip in href.lower() for skip in ['category', 'collection', 'tag', 'page', 'cart', 'checkout', 'account']):
                             product_links.add(full_url)
-        
+
         next_selectors = ["a.next", ".pagination a[rel='next']", "a[aria-label='Next']"]
         for selector in next_selectors:
             next_link = soup.select_one(selector)
@@ -510,9 +655,9 @@ def get_product_links(category_url, session, use_playwright=False):
                 next_url = urljoin(category_url, next_link.get("href"))
                 product_links.update(get_product_links(next_url, session))
                 break
-                
+
     except Exception as e:
-        print(f"Error fetching {category_url}: {e}", file=sys.stderr)
+        log(f"Error fetching {category_url}: {e}")
 
     return product_links
 
@@ -600,14 +745,14 @@ def extract_product_data(url, session=None, use_playwright=False):
         if not html_content:
             resp = fetch_url(session, url, timeout=20)
             if not resp:
-                print(f"Skipping {url} after repeated blocks.", file=sys.stderr)
+                log(f"Skipping {url} after repeated blocks.")
                 return None
             html_content = resp.text
-        
+
         soup = BeautifulSoup(html_content, "html.parser")
 
         if not is_simple_product(soup):
-            print(f"Skipping (not simple): {url}", file=sys.stderr)
+            log(f"Skipping (not simple): {url}")
             return None
 
         # Name - Universal selectors for all platforms (including Wix)
@@ -782,7 +927,7 @@ def extract_product_data(url, session=None, use_playwright=False):
         }
 
     except Exception as e:
-        print(f"Error processing {url}: {e}", file=sys.stderr)
+        log(f"Error processing {url}: {e}")
         return None
 
 
@@ -829,35 +974,35 @@ def send_progress_update(api_base_url, agent_token, discovered=None, sent=None, 
         
         response = requests.post(progress_url, json=payload, headers=headers, timeout=10)
         if response.status_code == 202:
-            print(f"📊 Progress update sent: {message or payload}", file=sys.stderr)
+            log(f"📊 Progress update sent: {message or payload}")
         else:
-            print(f"⚠️ Progress update failed: {response.status_code}", file=sys.stderr)
+            log(f"⚠️ Progress update failed: {response.status_code}")
     except Exception as e:
         # Don't fail the scrape if progress updates fail
-        print(f"⚠️ Progress update error: {e}", file=sys.stderr)
+        log(f"⚠️ Progress update error: {e}")
 
 
 def send_item_to_api(api_base_url, agent_token, item):
     """Send a single item to the backend API immediately after scraping.
-    
+
     Args:
         api_base_url: Base URL for the API (e.g., https://staging.rekohub.com/api)
         agent_token: Bearer token for authentication
         item: Item dict with name, price, description, imageUrl, url
-        
+
     Returns:
         bool: True if successful, False otherwise
     """
     if not api_base_url or not agent_token:
         return False
-    
+
     try:
         items_url = f"{api_base_url.rstrip('/')}/v4/auto-onboard/items"
         headers = {
             'Authorization': f'Bearer {agent_token}',
             'Content-Type': 'application/json'
         }
-        
+
         # Map our item format to the API format
         # The API expects: name, description, price, imageUrl
         # Our item has: name, price, description, imageUrl, url
@@ -868,82 +1013,85 @@ def send_item_to_api(api_base_url, agent_token, item):
             'imageUrl': item.get('imageUrl', ''),
             'sourceItemId': item.get('url', '')  # Use source URL as identifier
         }
-        
+
         response = requests.post(items_url, json=payload, headers=headers, timeout=15)
         if response.status_code == 202:
-            print(f"✅ Item sent to API: {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
+            log(f"✅ Item sent to API: {item.get('name', 'Unknown')[:50]}")
             return True
         else:
-            print(f"⚠️ Failed to send item (HTTP {response.status_code}): {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
+            log(f"⚠️ Failed to send item (HTTP {response.status_code}): {item.get('name', 'Unknown')[:50]}")
             return False
     except Exception as e:
-        print(f"⚠️ Error sending item to API: {e}", file=sys.stderr)
+        log(f"⚠️ Error sending item to API: {e}")
         return False
 
 
 def scrape_site(base_url, api_base_url=None, agent_token=None):
     """Main scraping function.
-    
+
     Automatically detects JavaScript-rendered sites (like Wix, React SPAs) and
     uses Playwright browser rendering when needed.
-    
+
     Args:
         base_url: The URL to scrape
         api_base_url: Optional API base URL for progress updates
         agent_token: Optional bearer token for progress updates
     """
+    # Set the site tag for logging in this thread
+    set_current_site(base_url)
+
     session = build_retry_session()
     category_url = base_url
     use_playwright = False  # Will be set to True if JS-rendering is detected
-    
+
     # STEP 0: Quick check if site is JS-rendered or bot-protected
     # This saves time by avoiding multiple failed requests before trying Playwright
     if USE_PLAYWRIGHT:
-        print("🔍 Quick check: Testing if site is JavaScript-rendered...", file=sys.stderr)
+        log("🔍 Quick check: Testing if site is JavaScript-rendered...")
         # Do a quick single request (not the full retry loop)
         try:
             quick_resp = session.get(base_url, headers=build_rotating_headers(), timeout=10)
             if quick_resp and quick_resp.status_code == 200:
                 if is_js_rendered_site(quick_resp.text, base_url):
-                    print("🌐 Detected JavaScript-rendered site (Wix/React/Vue)! Using Playwright...", file=sys.stderr)
+                    log("🌐 Detected JavaScript-rendered site (Wix/React/Vue)! Using Playwright...")
                     use_playwright = True
                 elif looks_like_bot_block(quick_resp):
-                    print("🔒 Bot protection detected! Using Playwright browser...", file=sys.stderr)
+                    log("🔒 Bot protection detected! Using Playwright browser...")
                     use_playwright = True
             else:
                 # Non-200 response or no response - likely bot protection
-                print("🔒 Site may be blocking requests! Using Playwright browser...", file=sys.stderr)
+                log("🔒 Site may be blocking requests! Using Playwright browser...")
                 use_playwright = True
         except Exception as e:
-            print(f"⚠️ Quick check failed ({e}), will try Playwright...", file=sys.stderr)
+            log(f"⚠️ Quick check failed ({e}), will try Playwright...")
             use_playwright = True
-    
+
     # If Playwright is needed, skip the slow HTTP methods and go straight to browser rendering
     if use_playwright:
-        print("🎭 Using Playwright browser to render JavaScript...", file=sys.stderr)
+        log("🎭 Using Playwright browser to render JavaScript...")
         product_links = get_product_links(base_url, session, use_playwright=True)
     else:
         # Standard scraping flow for non-JS sites
-        print("Method 1: Trying sitemap...", file=sys.stderr)
+        log("Method 1: Trying sitemap...")
         product_links = get_product_links_from_sitemap(base_url, session)
-        
+
         if not product_links:
-            print("Method 2: Searching for product pages...", file=sys.stderr)
+            log("Method 2: Searching for product pages...")
             category_url = detect_category_page(base_url, session)
             product_links = get_product_links(category_url, session, use_playwright=False)
-        
+
         # If still no products, try Playwright as last resort
         if not product_links and USE_PLAYWRIGHT:
-            print("Method 3: Trying Playwright browser as fallback...", file=sys.stderr)
+            log("Method 3: Trying Playwright browser as fallback...")
             use_playwright = True
             product_links = get_product_links(base_url, session, use_playwright=True)
-    
+
     # If still no products, try scraping the homepage directly
     if not product_links and base_url != category_url:
-        print("Method 4: Trying homepage...", file=sys.stderr)
+        log("Method 4: Trying homepage...")
         product_links = get_product_links(base_url, session, use_playwright=use_playwright)
-    
-    print(f"\n🔗 Found {len(product_links)} product links", file=sys.stderr)
+
+    log(f"🔗 Found {len(product_links)} product links")
     
     # Send initial discovery progress update
     send_progress_update(
@@ -956,34 +1104,34 @@ def scrape_site(base_url, api_base_url=None, agent_token=None):
     )
     
     if len(product_links) == 0:
-        print("\n❌ No products found!", file=sys.stderr)
-        print("Possible reasons:", file=sys.stderr)
+        log("❌ No products found!")
+        log("Possible reasons:")
         if not USE_PLAYWRIGHT:
-            print("  1. The site uses JavaScript - install playwright: pip install playwright && playwright install chromium", file=sys.stderr)
+            log("  1. The site uses JavaScript - install playwright: pip install playwright && playwright install chromium")
         else:
-            print("  1. The site may use a custom JavaScript framework not yet supported", file=sys.stderr)
-        print("  2. The site may be blocking automated access", file=sys.stderr)
-        print("  3. Try providing a direct category/product listing page URL", file=sys.stderr)
-        print("\n💡 Tip: Navigate to a product category page in your browser,", file=sys.stderr)
-        print("   copy that URL, and use it with the scraper.\n", file=sys.stderr)
+            log("  1. The site may use a custom JavaScript framework not yet supported")
+        log("  2. The site may be blocking automated access")
+        log("  3. Try providing a direct category/product listing page URL")
+        log("💡 Tip: Navigate to a product category page in your browser,")
+        log("   copy that URL, and use it with the scraper.")
 
     # Surface what rendering modes are available
     if USE_PLAYWRIGHT:
-        print("✅ Playwright browser rendering enabled for JavaScript sites...", file=sys.stderr)
+        log("✅ Playwright browser rendering enabled for JavaScript sites...")
     else:
-        print("⚠️ Playwright not installed - JS sites may not work (pip install playwright && playwright install chromium)...", file=sys.stderr)
-    
+        log("⚠️ Playwright not installed - JS sites may not work (pip install playwright && playwright install chromium)...")
+
     if USE_CLOUDSCRAPER:
-        print("✅ Cloudscraper fallback enabled for tough endpoints...", file=sys.stderr)
+        log("✅ Cloudscraper fallback enabled for tough endpoints...")
     else:
-        print("⚠️ Using hardened requests session (install cloudscraper for tougher sites)...", file=sys.stderr)
-    
+        log("⚠️ Using hardened requests session (install cloudscraper for tougher sites)...")
+
     data = []
     skipped = 0
     sent_count = 0
     total_links = len(product_links)
     has_api_integration = bool(api_base_url and agent_token)
-    
+
     # Send initial scraping phase update
     send_progress_update(
         api_base_url,
@@ -994,15 +1142,15 @@ def scrape_site(base_url, api_base_url=None, agent_token=None):
         phase="scraping",
         message=f"Starting to scrape {total_links} products"
     )
-    
+
     for i, url in enumerate(product_links, 1):
-        print(f"Processing {i}/{total_links}: {url}", file=sys.stderr)
+        log(f"Processing {i}/{total_links}: {url}")
         # Use Playwright for product pages if the site was detected as JS-rendered
         item = extract_product_data(url, session, use_playwright=use_playwright)
-        
+
         if item:
             data.append(item)
-            print(f"✓ Scraped: {item.get('name', 'Unknown')[:50]}", file=sys.stderr)
+            log(f"✓ Scraped: {item.get('name', 'Unknown')[:50]}")
             
             # If API integration is enabled, send item immediately
             if has_api_integration:
@@ -1044,9 +1192,9 @@ def scrape_site(base_url, api_base_url=None, agent_token=None):
     has_api_integration = bool(api_base_url and agent_token)
     final_count = sent_count if has_api_integration else len(data)
     
-    print(f"\n📊 Summary: {len(data)} simple products scraped, {skipped} skipped", file=sys.stderr)
+    log(f"📊 Summary: {len(data)} simple products scraped, {skipped} skipped")
     if has_api_integration:
-        print(f"📤 Sent {sent_count} items to API", file=sys.stderr)
+        log(f"📤 Sent {sent_count} items to API")
     
     # Send final completion update
     send_progress_update(
